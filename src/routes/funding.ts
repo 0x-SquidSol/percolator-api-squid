@@ -35,6 +35,17 @@ const logger = createLogger("api:funding");
  * Maximum valid funding rate in bps/slot (matches on-chain guard).
  * Raw DB values outside [-MAX, MAX] are garbage from uninitialized slabs.
  * Returns 0 for garbage values to avoid rendering astronomical percentages.
+ *
+ * v17 NOTE: In v17 the on-chain engine stores funding_rate_e9 (i128 in e9 units)
+ * which the PermissionlessCrank hardcodes to 0n (hard-rejected if nonzero). The
+ * DB column `funding_rate` is written by the v17 indexer — the unit stored there
+ * is the same bps/slot representation this route already uses, derived by the
+ * indexer from the engine's `fundingRateBpsPerSlotLast` field. No change needed
+ * in this file; the response shape is forward-compatible with v17 indexer output.
+ *
+ * v17 also introduces per-asset funding (domain u16 replaces domain u8). The DB
+ * row for multi-asset markets is keyed by (slab_address, asset_index). The response
+ * includes `assetIndex` from the DB row when present; pre-v17 markets default to 0.
  */
 const MAX_FUNDING_RATE_BPS = 10_000;
 function sanitizeFundingRateBps(raw: number): number {
@@ -69,17 +80,21 @@ export function fundingRoutes(): Hono {
         // GH#1459: Filter blocked slabs from the global response.
         // validateSlab middleware only runs on /:slab routes; the global endpoint
         // queries all market_stats rows and previously exposed blocked slabs
-        // (8eFFEFBY, 3bmCyPee, 3YDqCJGz, 3ZKKwsK) with phantom netLpPosition values.
+        // (8eFFEFBY, 3bmCyPee, 3YDqCJGz, 3ZKKwsK) with phantom netLpPos values.
         const markets = (allStats ?? [])
           .filter((stats) => !isBlockedSlab(stats.slab_address))
           .map((stats) => {
             const rateBps = sanitizeFundingRateBps(Number(stats.funding_rate ?? 0));
             return {
               slabAddress: stats.slab_address,
+              // v17: per-asset index. Pre-v17 rows have no asset_index column (defaults to 0).
+              assetIndex: (stats as Record<string, unknown>).asset_index != null
+                ? Number((stats as Record<string, unknown>).asset_index)
+                : 0,
               currentRateBpsPerSlot: rateBps,
               hourlyRatePercent: Number(((rateBps / 10000.0) * SLOTS_PER_HOUR).toFixed(6)),
               dailyRatePercent: Number(((rateBps / 10000.0) * SLOTS_PER_DAY).toFixed(4)),
-              netLpPosition: stats.net_lp_pos ?? "0",
+              netLpPos: stats.net_lp_pos ?? "0",
             };
           });
 
@@ -88,10 +103,13 @@ export function fundingRoutes(): Hono {
       c
     );
 
-    // withDbCacheFallback returns a Response on failure (503 with stale data or error)
+    // withDbCacheFallback returns a Response on failure (503 when both the
+    // query failed and no usable cache exists). On success — fresh or stale
+    // fallback — it returns a DbCacheResult; staleness HTTP headers are
+    // already set on the context by the middleware.
     if (result instanceof Response) return result;
 
-    return c.json(result);
+    return c.json(result.data);
   });
 
   /**
@@ -105,7 +123,7 @@ export function fundingRoutes(): Hono {
    *   "hourlyRatePercent": 0.42,
    *   "dailyRatePercent": 10.08,
    *   "annualizedPercent": 3679.2,
-   *   "netLpPosition": "1500000",
+   *   "netLpPos": "1500000",
    *   "fundingIndexQpbE6": "123456789",
    *   "lastUpdatedSlot": 123456789,
    *   "last24hHistory": [
@@ -123,6 +141,8 @@ export function fundingRoutes(): Hono {
       // metadata.last_price. Falls back gracefully if market row is missing.
       const { data: stats, error: statsError } = await getSupabase()
         .from("markets_with_stats")
+        // asset_index is not in the markets_with_stats schema (no migration defines it) — selecting it
+        // causes a PostgREST 400. Downstream defaults assetIndex to 0. Same fix as crank.ts (e471efb).
         .select("funding_rate, net_lp_pos, symbol, last_price")
         .eq("slab_address", slab)
         .single();
@@ -140,7 +160,7 @@ export function fundingRoutes(): Hono {
 
       // Parse current funding data
       const currentRateBpsPerSlot = stats.funding_rate ?? 0;
-      const netLpPosition = stats.net_lp_pos ?? "0";
+      const netLpPos = stats.net_lp_pos ?? "0";
 
       // Calculate rates
       // Solana slots: ~2.5 slots/second = 400ms per slot
@@ -177,19 +197,23 @@ export function fundingRoutes(): Hono {
       }));
 
       // GH#1511: Sanitize last_price from markets_with_stats — same ceiling used
-      // in /api/markets to guard against unscaled admin-set test prices.
-      const MAX_SANE_PRICE_USD = 1_000_000;
+      // in /markets to guard against unscaled admin-set test prices.
+      const MAX_SANE_PRICE_USD = 1_000_000_000;
       const rawLastPrice = Number(stats.last_price ?? 0);
       const sanitizedLastPrice =
         rawLastPrice > 0 && rawLastPrice <= MAX_SANE_PRICE_USD ? rawLastPrice : null;
 
       return c.json({
         slabAddress: slab,
+        // v17: per-asset index. Pre-v17 rows have no asset_index column (null → 0).
+        assetIndex: (stats as Record<string, unknown>).asset_index != null
+          ? Number((stats as Record<string, unknown>).asset_index)
+          : 0,
         currentRateBpsPerSlot: rateBps,
         hourlyRatePercent: Number(hourlyRatePercent.toFixed(6)),
         dailyRatePercent: Number(dailyRatePercent.toFixed(4)),
         annualizedPercent: Number(annualizedPercent.toFixed(2)),
-        netLpPosition,
+        netLpPos,
         last24hHistory,
         metadata: {
           // GH#1511: Populate symbol and last_price from markets_with_stats.
@@ -233,7 +257,7 @@ export function fundingRoutes(): Hono {
    *
    * GH#36
    */
-  app.get("/funding/:slab/historySince", validateSlab, async (c) => {
+  app.get("/funding/:slab/historySince", cacheMiddleware(30), validateSlab, async (c) => {
     const slab = c.req.param("slab");
     if (!slab) return c.json({ error: "slab required" }, 400);
 
@@ -284,9 +308,12 @@ export function fundingRoutes(): Hono {
     }
 
     try {
-      let history = await getFundingHistorySince(slab, validatedSince);
+      // #186: pass the row cap to the query so the DB bounds the read (LIMIT) instead of
+      // materializing the entire matching set and trimming in JS. The slice below is now
+      // a defensive no-op.
+      let history = await getFundingHistorySince(slab, validatedSince, limit);
 
-      // Enforce row cap
+      // Enforce row cap (defensive — the query already applies LIMIT)
       if (history.length > limit) {
         history = history.slice(0, limit);
       }
@@ -336,7 +363,7 @@ export function fundingRoutes(): Hono {
    * - limit: number of records (default 100, max 1000)
    * - since: ISO timestamp (default: 24h ago)
    */
-  app.get("/funding/:slab/history", validateSlab, async (c) => {
+  app.get("/funding/:slab/history", cacheMiddleware(30), validateSlab, async (c) => {
     const slab = c.req.param("slab");
     if (!slab) return c.json({ error: "slab required" }, 400);
     const limitParam = c.req.query("limit");
@@ -372,8 +399,10 @@ export function fundingRoutes(): Hono {
           }
           validatedSince = d.toISOString();
         }
-        history = await getFundingHistorySince(slab, validatedSince);
-        // PERC-8178: Enforce row cap on since-based queries
+        // #186: bound the DB read (LIMIT MAX_ROWS) so a far-past `since` can't force a full
+        // per-slab scan + full materialization; the slice below is now a defensive no-op.
+        history = await getFundingHistorySince(slab, validatedSince, MAX_ROWS);
+        // PERC-8178: Enforce row cap on since-based queries (defensive — query applies LIMIT)
         if (history.length > MAX_ROWS) {
           history = history.slice(0, MAX_ROWS);
         }

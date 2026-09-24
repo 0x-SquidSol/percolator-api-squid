@@ -1,3 +1,23 @@
+> # ⚰️ DECOMMISSIONED — archived 2026-08-18
+>
+> This service is **no longer deployed** and this repository is **archived (read-only)**.
+>
+> | endpoint | status |
+> |---|---|
+> | `percolator-api-production.up.railway.app` | `404 Application not found` |
+> | `api.percolatorlaunch.com` | NXDOMAIN |
+> | `api.percolator.trade` | NXDOMAIN |
+>
+> `percolator-launch` removed every proxy to this API (`app/app/api/prices/route.ts:95`); the live
+> playground serves those routes from its own Next handlers. `main` last moved 2026-06-24.
+>
+> **28 open PRs were closed with review notes on 2026-08-18** — each was reviewed on its merits
+> first; they were closed because the service is gone, not because the patches were wrong.
+>
+> The `sdk-smoke` publish-regression gate that lived here is **not lost** — it survives in
+> [`percolator-indexer`](https://github.com/dcccrypto/percolator-indexer/blob/main/.github/workflows/sdk-smoke.yml),
+> which is green nightly, pinned current, and injection-safe.
+
 # @percolator/api
 
 > REST API for the Percolator perpetual futures trading engine on Solana.
@@ -58,22 +78,33 @@ pnpm test
 
 ## API Endpoints
 
-| Method | Endpoint               | Description                    |
-|--------|------------------------|--------------------------------|
-| GET    | `/health`              | Health check                   |
-| GET    | `/docs`                | OpenAPI documentation          |
-| GET    | `/v1/markets`          | List all markets               |
-| GET    | `/v1/markets/:address` | Single market details          |
-| GET    | `/v1/prices`           | Current prices                 |
-| GET    | `/v1/prices/history`   | Price history (OHLCV)          |
-| GET    | `/v1/trades`           | Trade history                  |
-| GET    | `/v1/funding`          | Current funding rates          |
-| GET    | `/v1/funding/history`  | Funding rate history           |
-| GET    | `/v1/open-interest`    | Open interest data             |
-| GET    | `/v1/insurance`        | Insurance fund info            |
-| GET    | `/v1/stats`            | Platform statistics            |
-| GET    | `/v1/crank`            | Crank status                   |
-| WS     | `/ws`                  | WebSocket for live updates     |
+| Method | Endpoint                        | Description                    |
+|--------|---------------------------------|--------------------------------|
+| GET    | `/health`                       | Health check                   |
+| GET    | `/docs`                         | OpenAPI documentation          |
+| GET    | `/markets`                      | List all markets               |
+| GET    | `/markets/:slab`                | Single market details (on-chain) |
+| GET    | `/markets/stats`                | All market stats               |
+| GET    | `/markets/:slab/stats`          | Single market stats            |
+| GET    | `/markets/:slab/trades`         | Trade history for a market     |
+| GET    | `/markets/:slab/volume`         | 24h volume for a market        |
+| GET    | `/markets/:slab/prices`         | Price history for a market     |
+| GET    | `/prices/markets`               | Current prices for all markets |
+| GET    | `/prices/:slab`                 | Oracle price history           |
+| GET    | `/trades/recent`                | Recent trades (global)         |
+| GET    | `/funding/global`               | Funding rates for all markets  |
+| GET    | `/funding/:slab`                | Funding rate for a market      |
+| GET    | `/funding/:slab/history`        | Funding rate history           |
+| GET    | `/funding/:slab/historySince`   | Funding history since timestamp |
+| GET    | `/open-interest/:slab`          | Open interest data             |
+| GET    | `/insurance/:slab`              | Insurance fund info            |
+| GET    | `/stats`                        | Platform statistics            |
+| GET    | `/crank/status`                 | Crank status                   |
+| GET    | `/oracle/resolve/:mint`         | Oracle price resolution        |
+| GET    | `/chart/:mint`                  | OHLCV candle data              |
+| GET    | `/api/adl/rankings`             | ADL rankings                   |
+| GET    | `/ws/stats`                     | WebSocket metrics (auth required) |
+| WS     | `/`                             | WebSocket for live updates     |
 
 ## Dependencies
 

@@ -3,8 +3,17 @@ import { PublicKey } from "@solana/web3.js";
 import { validateSlab, isBlockedSlab } from "../middleware/validateSlab.js";
 import { cacheMiddleware } from "../middleware/cache.js";
 import { withDbCacheFallback } from "../middleware/db-cache-fallback.js";
-import { fetchSlab, parseHeader, parseConfig, parseEngine } from "@percolatorct/sdk";
+import {
+  fetchSlab,
+  parseHeader,
+  parseConfig,
+  parseEngine,
+  isV17Account,
+  parseWrapperConfigV17,
+} from "@percolatorct/sdk";
 import { getConnection, getSupabase, getNetwork, createLogger, sanitizeSlabAddress, truncateErrorMessage } from "@percolator/shared";
+import { withRpcFallback } from "../utils/rpc-fallback.js";
+import { RpcTimeoutError } from "../utils/rpc-timeout.js";
 
 const logger = createLogger("api:markets");
 
@@ -70,30 +79,37 @@ export function marketRoutes(): Hono {
       c
     );
     
-    // If result is a Response (error case), return it directly
+    // If result is a Response (error case — DB failed AND no usable cache),
+    // return it directly. Otherwise unwrap the DbCacheResult; staleness
+    // headers are already set on the context by the middleware.
     if (result instanceof Response) {
       return result;
     }
-    
-    return c.json({ markets: result });
+
+    return c.json({ markets: result.data });
   });
 
   // GET /markets/stats — all market stats from DB (filtered by network)
   app.get("/markets/stats", async (c) => {
-    try {
-      const { data, error } = await getSupabase()
-        .from("markets_with_stats")
-        .select("slab_address, total_open_interest, total_accounts, last_crank_slot, last_price, mark_price, index_price, funding_rate, net_lp_pos, updated_at")
-        .eq("network", getNetwork())
-        .not("slab_address", "is", null);
-      if (error) throw error;
-      return c.json({ stats: data ?? [] });
-    } catch (err) {
-      logger.error("Error fetching all market stats", {
-        error: truncateErrorMessage(err instanceof Error ? err.message : String(err), 120),
-      });
-      return c.json({ error: "Failed to fetch market stats" }, 500);
+    const result = await withDbCacheFallback(
+      "markets:stats",
+      async () => {
+        const { data, error } = await getSupabase()
+          .from("markets_with_stats")
+          .select("slab_address, total_open_interest, total_accounts, last_crank_slot, last_price, mark_price, index_price, funding_rate, net_lp_pos, lp_sum_abs, lp_max_abs, insurance_balance, insurance_fee_revenue, volume_24h, updated_at")
+          .eq("network", getNetwork())
+          .not("slab_address", "is", null);
+        if (error) throw error;
+        return data ?? [];
+      },
+      c
+    );
+
+    if (result instanceof Response) {
+      return result;
     }
+
+    return c.json({ stats: result.data });
   });
 
   // GET /markets/:slab/stats — single market stats from DB
@@ -102,7 +118,7 @@ export function marketRoutes(): Hono {
     try {
       const { data, error } = await getSupabase()
         .from("market_stats")
-        .select("slab_address, total_open_interest, total_accounts, last_crank_slot, last_price, mark_price, index_price, funding_rate, net_lp_pos, updated_at")
+        .select("slab_address, total_open_interest, total_accounts, last_crank_slot, last_price, mark_price, index_price, funding_rate, net_lp_pos, lp_sum_abs, lp_max_abs, insurance_balance, insurance_fee_revenue, volume_24h, updated_at")
         .eq("slab_address", slab)
         .single();
       if (error && error.code !== "PGRST116") throw error;
@@ -117,19 +133,53 @@ export function marketRoutes(): Hono {
   });
 
   // GET /markets/:slab — single market details (on-chain read) — 10s cache
+  // Supports both v12.x slabs (parseConfig path) and v17 market-group accounts
+  // (parseWrapperConfigV17 path). isV17Account() detects the magic + version.
   app.get("/markets/:slab", cacheMiddleware(10), validateSlab, async (c) => {
     const slab = c.req.param("slab");
     if (!slab) return c.json({ error: "slab required" }, 400);
     try {
-      const connection = getConnection();
       const slabPubkey = new PublicKey(slab);
-      const data = await fetchSlab(connection, slabPubkey);
+      const data = await withRpcFallback(
+        (conn) => fetchSlab(conn, slabPubkey),
+        getConnection(),
+        `fetchSlab(${slab})`,
+      );
+
+      if (isV17Account(data)) {
+        // v17 market-group account: 16-byte header + 432-byte WrapperConfigV16.
+        // No engine block — stats come from the indexer DB, not the on-chain account.
+        const cfg = parseWrapperConfigV17(data);
+        return c.json({
+          slabAddress: slab,
+          accountVersion: 17,
+          header: {
+            // v17 header is 16 bytes: magic(8)+version(2)+kind(1)+pad(1)+reserved(4).
+            // No admin field — authority is cfg.marketauth.
+            magic: "0x5045524356313600",
+            version: 17,
+            marketauth: cfg.marketauth.toBase58(),
+          },
+          config: {
+            collateralMint: cfg.collateralMint.toBase58(),
+            marketauth: cfg.marketauth.toBase58(),
+            tradeFeeBps: cfg.tradeFeeBps.toString(),
+            unitScale: cfg.unitScale,
+          },
+          // v17 engine state is per-portfolio, not in the market-group account.
+          // Clients should query /markets/:slab/stats for indexed state.
+          engine: null,
+        });
+      }
+
+      // v12.x slab: legacy path
       const header = parseHeader(data);
       const cfg = parseConfig(data);
       const engine = parseEngine(data);
 
       return c.json({
         slabAddress: slab,
+        accountVersion: header.version,
         header: {
           magic: header.magic.toString(),
           version: header.version,
@@ -150,6 +200,10 @@ export function marketRoutes(): Hono {
         },
       });
     } catch (err) {
+      if (err instanceof RpcTimeoutError) {
+        logger.warn("RPC timeout fetching market", { slab, timeoutMs: err.timeoutMs });
+        return c.json({ error: "Upstream RPC timeout" }, 504);
+      }
       const detail = err instanceof Error ? err.message : "Unknown error";
       const isNotFound = detail.includes("not found") || detail.includes("Account does not exist");
       if (isNotFound) {

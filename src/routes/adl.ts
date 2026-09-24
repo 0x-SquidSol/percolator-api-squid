@@ -44,12 +44,15 @@ import {
   parseEngine,
   parseConfig,
   parseAllAccounts,
+  isV17Account,
 } from "@percolatorct/sdk";
 import {
   getConnection,
   createLogger,
   sanitizeSlabAddress,
 } from "@percolator/shared";
+import { withRpcFallback } from "../utils/rpc-fallback.js";
+import { RpcTimeoutError } from "../utils/rpc-timeout.js";
 import { isBlockedSlab } from "../middleware/validateSlab.js";
 
 const logger = createLogger("api:adl");
@@ -103,6 +106,20 @@ interface RankedPosition {
 }
 
 function rankProfitablePositions(data: Uint8Array): RankedPosition[] {
+  // v17 desync fix (PERC-DESYNC-1 / blocker): in v17 the market-group account
+  // uses V17_MAGIC ("PERCV16\0") and does NOT embed portfolio accounts in the slab.
+  // Portfolios are standalone on-chain accounts. parseAllAccounts() is v12-only
+  // (bitmap-indexed embedded layout). Detect v17 and return empty — the ADL
+  // trigger state (capExceeded / utilizationTriggered) is still surfaced; ranking
+  // requires a separate portfolio-scan path not implemented at the API layer.
+  if (isV17Account(data)) {
+    logger.warn(
+      "rankProfitablePositions: v17 market-group account detected — " +
+      "portfolio positions are standalone accounts and cannot be ranked from slab bytes. " +
+      "Returning empty rankings; ADL trigger state is still valid.",
+    );
+    return [];
+  }
   const allAccounts = parseAllAccounts(data);
   const profitable: Array<{
     idx: number;
@@ -165,6 +182,11 @@ export function adlRoutes(): Hono {
     // Check cache to avoid redundant expensive RPC calls
     const cached = adlCache.get(slab);
     if (cached && Date.now() - cached.fetchedAt < ADL_CACHE_TTL_MS) {
+      // Promote to most-recently-used so the FIFO-by-insertion eviction
+      // at lines below behaves as LRU. Without this, hot keys inserted
+      // early get evicted while cold keys inserted later survive.
+      adlCache.delete(slab);
+      adlCache.set(slab, cached);
       return c.json(cached.data, 200, { "X-Cache": "HIT" });
     }
 
@@ -178,11 +200,18 @@ export function adlRoutes(): Hono {
       return c.json({ error: "Market not found" }, 404);
     }
 
-    const connection = getConnection();
     let data: Uint8Array;
     try {
-      data = await fetchSlab(connection, new PublicKey(slab));
+      data = await withRpcFallback(
+        (conn) => fetchSlab(conn, new PublicKey(slab)),
+        getConnection(),
+        `fetchSlab(${slab})`,
+      );
     } catch (err) {
+      if (err instanceof RpcTimeoutError) {
+        logger.warn("RPC timeout fetching slab for ADL", { slab, timeoutMs: err.timeoutMs });
+        return c.json({ error: "Upstream RPC timeout", slab }, 504);
+      }
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("not found")) {
         return c.json({ error: "Slab account not found", slab }, 404);
@@ -191,22 +220,36 @@ export function adlRoutes(): Hono {
       return c.json({ error: "Failed to fetch slab data" }, 500);
     }
 
+    // v17 desync fix (PERC-DESYNC-1 / blocker): v17 market-group accounts have a
+    // different magic ("PERCV16\0") and layout — parseEngine/parseConfig expect the
+    // v12.x "PERCOLAT" slab magic and will throw on v17 data. Detect early and return
+    // a clear actionable error instead of the generic "may be uninitialized" message.
+    if (isV17Account(data)) {
+      logger.warn("adl/rankings: v17 market-group account — portfolio positions are standalone accounts", { slab });
+      return c.json(
+        {
+          error:
+            "v17 market detected: portfolio positions are stored in standalone on-chain accounts " +
+            "and cannot be read from the market-group account. ADL ranking is not available " +
+            "via this endpoint for v17 markets.",
+          slab,
+        },
+        400,
+      );
+    }
+
     let engine: ReturnType<typeof parseEngine>;
-    let cfg: ReturnType<typeof parseConfig> & { maxPnlCap?: bigint };
+    let cfg: ReturnType<typeof parseConfig>;
     try {
       engine = parseEngine(data);
-      // NOTE: parseConfig returns MarketConfig. The `maxPnlCap` field was added in a
-      // later SDK version. We cast to `any` to read it where available, falling back
-      // to 0n on older SDK builds. When the API SDK is bumped to ≥47e3799, remove the cast.
-      cfg = parseConfig(data) as ReturnType<typeof parseConfig> & { maxPnlCap?: bigint };
+      cfg = parseConfig(data);
     } catch (err) {
       logger.error("parseEngine/parseConfig failed", { slab, error: err instanceof Error ? err.message : String(err) });
       return c.json({ error: "Slab data could not be parsed — may be uninitialized or corrupted" }, 400);
     }
 
     const pnlPosTot = engine.pnlPosTot;
-    // maxPnlCap fallback to 0n disables cap-exceeded trigger on older SDK builds
-    const maxPnlCap: bigint = cfg.maxPnlCap ?? 0n;
+    const maxPnlCap: bigint = cfg.maxPnlCap;
     const insBalance = engine.insuranceFund.balance;
     const insFeeRevenue = engine.insuranceFund.feeRevenue;
 

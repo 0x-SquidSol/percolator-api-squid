@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { crankStatusRoutes } from "../../src/routes/crank.js";
+import { clearDbCache } from "../../src/middleware/db-cache-fallback.js";
 
 // Mock @percolator/shared
 vi.mock("@percolator/shared", () => ({
@@ -45,6 +46,7 @@ describe("crank routes", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    clearDbCache();
 
     mockSupabase = {
       from: vi.fn(() => chainable({ data: [], error: null })),
@@ -76,8 +78,9 @@ describe("crank routes", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.markets).toHaveLength(2);
-      expect(data.markets[0].slab_address).toBe("11111111111111111111111111111111");
-      expect(data.markets[0].last_crank_slot).toBe(123456789);
+      // v17: response uses camelCase field names
+      expect(data.markets[0].slabAddress).toBe("11111111111111111111111111111111");
+      expect(data.markets[0].lastCrankSlot).toBe(123456789);
     });
 
     it("should handle empty markets list", async () => {
@@ -108,11 +111,12 @@ describe("crank routes", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.markets).toHaveLength(1);
-      expect(data.markets[0].last_crank_slot).toBeNull();
-      expect(data.markets[0].updated_at).toBeNull();
+      // v17: camelCase field names
+      expect(data.markets[0].lastCrankSlot).toBeNull();
+      expect(data.markets[0].updatedAt).toBeNull();
     });
 
-    it("should handle database errors", async () => {
+    it("should handle database errors with 503 (no stale cache)", async () => {
       mockSupabase.from.mockReturnValue(chainable({
         data: null,
         error: new Error("Database error"),
@@ -121,9 +125,10 @@ describe("crank routes", () => {
       const app = crankStatusRoutes();
       const res = await app.request("/crank/status");
 
-      expect(res.status).toBe(500);
+      // withDbCacheFallback returns 503 when DB fails and no stale cache is available
+      expect(res.status).toBe(503);
       const data = await res.json();
-      expect(data.error).toBe("Failed to fetch crank status");
+      expect(data.error).toBe("Database temporarily unavailable");
     });
 
     it("should return all market stats fields", async () => {
@@ -142,9 +147,12 @@ describe("crank routes", () => {
 
       expect(res.status).toBe(200);
       const data = await res.json();
-      expect(data.markets[0]).toHaveProperty("slab_address");
-      expect(data.markets[0]).toHaveProperty("last_crank_slot");
-      expect(data.markets[0]).toHaveProperty("updated_at");
+      // v17: camelCase field names
+      expect(data.markets[0]).toHaveProperty("slabAddress");
+      expect(data.markets[0]).toHaveProperty("lastCrankSlot");
+      expect(data.markets[0]).toHaveProperty("updatedAt");
+      // asset_index is not in the schema (no migration); removed from SELECT to fix PostgREST 400
+      expect(data.markets[0]).not.toHaveProperty("assetIndex");
     });
 
     it("should handle large slot numbers", async () => {
@@ -163,7 +171,8 @@ describe("crank routes", () => {
 
       expect(res.status).toBe(200);
       const data = await res.json();
-      expect(data.markets[0].last_crank_slot).toBe(999999999999);
+      // v17: camelCase
+      expect(data.markets[0].lastCrankSlot).toBe(999999999999);
     });
 
     it("should preserve order from database", async () => {
@@ -193,9 +202,10 @@ describe("crank routes", () => {
       expect(res.status).toBe(200);
       const data = await res.json();
       expect(data.markets).toHaveLength(3);
-      expect(data.markets[0].slab_address).toBe("33333333333333333333333333333333");
-      expect(data.markets[1].slab_address).toBe("11111111111111111111111111111111");
-      expect(data.markets[2].slab_address).toBe("22222222222222222222222222222222");
+      // v17: camelCase slabAddress
+      expect(data.markets[0].slabAddress).toBe("33333333333333333333333333333333");
+      expect(data.markets[1].slabAddress).toBe("11111111111111111111111111111111");
+      expect(data.markets[2].slabAddress).toBe("22222222222222222222222222222222");
     });
   });
 });
